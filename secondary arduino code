@@ -1,0 +1,163 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <SoftwareSerial.h>
+
+#define SLAVE_ADDRESS 8  // I2C Address for Secondary Arduino
+#define TRIG_PIN 4
+#define ECHO_PIN 5
+#define REAR_TRIG_PIN 7
+#define REAR_ECHO_PIN 8
+#define MQ2_SENSOR A1
+#define IR_SENSOR 2
+#define BUZZER_PIN 11
+#define ALERT_LED 12
+#define OBSTACLE_LED 13
+#define SERVO_PIN 6
+#define ESP32CAM_TX 10
+#define ESP32CAM_RX 9
+
+Servo radarServo;
+SoftwareSerial espSerial(ESP32CAM_TX, ESP32CAM_RX); // ESP32-CAM communication
+String wifiSSID = "", wifiPASS = "";
+int distanceFront, distanceLeft, distanceRight, rearDistance;
+bool smokeDetected = false, fireDetected = false, weaponDetected = false, knifeDetected = false;
+
+void setup() {
+    Wire.begin(SLAVE_ADDRESS);
+    Serial.begin(115200);
+    espSerial.begin(9600);
+    Wire.onReceive(receiveEvent);
+    
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    pinMode(REAR_TRIG_PIN, OUTPUT);
+    pinMode(REAR_ECHO_PIN, INPUT);
+    pinMode(MQ2_SENSOR, INPUT);
+    pinMode(IR_SENSOR, INPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(ALERT_LED, OUTPUT);
+    pinMode(OBSTACLE_LED, OUTPUT);
+    radarServo.attach(SERVO_PIN);
+    Serial.println("Secondary Arduino Ready.");
+}
+
+void loop() {
+    scanSurroundings();
+    rearDistance = getDistance(REAR_TRIG_PIN, REAR_ECHO_PIN);
+    smokeDetected = analogRead(MQ2_SENSOR) > 400;
+    fireDetected = digitalRead(IR_SENSOR) == HIGH;
+
+    // Request threat detection from ESP32-CAM
+    espSerial.println("CHECK_THREAT");
+    delay(100);
+    if (espSerial.available()) {
+        String response = espSerial.readString();
+        weaponDetected = response.indexOf("WEAPON_DETECTED") >= 0;
+        knifeDetected = response.indexOf("KNIFE_DETECTED") >= 0;
+    }
+    
+    // Alert if any threat detected
+    if (smokeDetected || fireDetected || weaponDetected || knifeDetected) {
+        digitalWrite(ALERT_LED, HIGH);
+        digitalWrite(BUZZER_PIN, HIGH);
+        sendAlertToPrimary();
+    } else {
+        digitalWrite(ALERT_LED, LOW);
+        digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    // Obstacle alert
+    if (distanceFront < 30 || distanceLeft < 30 || distanceRight < 30 || rearDistance < 30) {
+        digitalWrite(OBSTACLE_LED, HIGH);
+    } else {
+        digitalWrite(OBSTACLE_LED, LOW);
+    }
+
+    // Forward Wi-Fi credentials to ESP32-CAM
+    if (wifiSSID.length() > 0 && wifiPASS.length() > 0) {
+        Serial.println("Forwarding Wi-Fi credentials to ESP32-CAM...");
+        espSerial.println("WIFI_SSID:" + wifiSSID);
+        espSerial.println("WIFI_PASS:" + wifiPASS);
+        wifiSSID = "";
+        wifiPASS = "";
+    }
+
+    sendDataToPrimary();
+    delay(500);
+}
+
+// Radar scanning
+void scanSurroundings() {
+    int angles[] = {90, 45, 135};
+    int *distances[] = {&distanceFront, &distanceLeft, &distanceRight};
+
+    for (int i = 0; i < 3; i++) {
+        radarServo.write(angles[i]);
+        delay(200);
+        *distances[i] = getDistance(TRIG_PIN, ECHO_PIN);
+    }
+}
+
+// Ultrasonic distance function
+int getDistance(int trigPin, int echoPin) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    return pulseIn(echoPin, HIGH) * 0.034 / 2;
+}
+
+// Receive data via I2C from Primary Arduino
+void receiveEvent(int bytes) {
+    char buffer[32];
+    int i = 0;
+    while (Wire.available() && i < sizeof(buffer) - 1) {
+        buffer[i++] = Wire.read();
+    }
+    buffer[i] = '\0';
+
+    String data = String(buffer);
+    
+    if (data.startsWith("SSID:")) {
+        wifiSSID = data.substring(5);
+        Serial.print("Received SSID: ");
+        Serial.println(wifiSSID);
+    } else if (data.startsWith("PASS:")) {
+        wifiPASS = data.substring(5);
+        Serial.print("Received Password: ");
+        Serial.println(wifiPASS);
+    } else if (data == "FACE_ON" || data == "FACE_OFF" || data == "STREAM_ON" || data == "STREAM_OFF" || data == "CAPTURE_IMG" || data == "FLASH_ON" || data == "FLASH_OFF") {
+        espSerial.println(data);
+    } else {
+        Serial.println("Invalid Command Received: " + data);
+    }
+}
+
+// Send sensor data to Primary Arduino via I2C
+void sendDataToPrimary() {
+    Wire.beginTransmission(SLAVE_ADDRESS);
+    Wire.write((distanceFront >> 8) & 0xFF);
+    Wire.write(distanceFront & 0xFF);
+    Wire.write((distanceLeft >> 8) & 0xFF);
+    Wire.write(distanceLeft & 0xFF);
+    Wire.write((distanceRight >> 8) & 0xFF);
+    Wire.write(distanceRight & 0xFF);
+    Wire.write((rearDistance >> 8) & 0xFF);
+    Wire.write(rearDistance & 0xFF);
+    Wire.write(smokeDetected);
+    Wire.write(fireDetected);
+    Wire.write(weaponDetected);
+    Wire.write(knifeDetected);
+    Wire.endTransmission();
+}
+
+// Send threat alert to Primary Arduino
+void sendAlertToPrimary() {
+    Wire.beginTransmission(SLAVE_ADDRESS);
+    if (smokeDetected) Wire.write("ALERT: SMOKE DETECTED");
+    if (fireDetected) Wire.write("ALERT: FIRE DETECTED");
+    if (weaponDetected) Wire.write("ALERT: WEAPON DETECTED");
+    if (knifeDetected) Wire.write("ALERT: KNIFE DETECTED");
+    Wire.endTransmission();
+}
