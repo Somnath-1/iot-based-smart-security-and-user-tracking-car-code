@@ -1,0 +1,197 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <EEPROM.h>
+#include "esp_http_server.h"
+
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pin.h"
+
+#define EEPROM_SIZE 100
+HardwareSerial BTSerial(1);  // Use UART1 for Bluetooth (TX: 14, RX: 15)
+
+String ssid = "";
+String password = "";
+bool flashLightState = false;
+bool faceRecognitionEnabled = false;
+bool liveStreamEnabled = true;
+bool captureImage = false;
+bool credentialsReceived = false;
+
+#define LED_PIN 4  // Flashlight LED pin on ESP32-CAM
+
+void startCameraServer();
+void connectToWiFi();
+void saveWiFiCredentials(String ssid, String password);
+void loadWiFiCredentials();
+void processBluetoothInput();
+void captureAndSendImage();
+static esp_err_t streamHandler(httpd_req_t *req);
+
+void setup() {
+    Serial.begin(115200);
+    BTSerial.begin(9600, SERIAL_8N1, 14, 15);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    EEPROM.begin(EEPROM_SIZE);
+    Serial.println("Loading Wi-Fi Credentials...");
+    loadWiFiCredentials();
+
+    if (ssid.length() == 0 || password.length() == 0) {
+        Serial.println("No Wi-Fi credentials found. Waiting for Bluetooth input...");
+        while (!credentialsReceived) {
+            processBluetoothInput();
+        }
+        saveWiFiCredentials(ssid, password);
+    }
+    connectToWiFi();
+
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+
+    if (psramFound()) {
+        config.frame_size = FRAMESIZE_QVGA;
+        config.jpeg_quality = 10;
+        config.fb_count = 2;
+    } else {
+        config.frame_size = FRAMESIZE_QVGA;
+        config.jpeg_quality = 12;
+        config.fb_count = 1;
+    }
+
+    if (esp_camera_init(&config) != ESP_OK) {
+        Serial.println("Camera Init Failed!");
+        return;
+    }
+
+    startCameraServer();
+    Serial.print("Access Stream at: http://");
+    Serial.println(WiFi.localIP());
+}
+
+void loop() {
+    processBluetoothInput();
+}
+
+void connectToWiFi() {
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.begin(ssid.c_str(), password.c_str());
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 20) {
+        delay(500);
+        Serial.print(".");
+        retry++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWi-Fi Connected!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        BTSerial.println("WiFi_Connected,IP:");
+        BTSerial.println(WiFi.localIP().toString());
+    } else {
+        Serial.println("\nWi-Fi Connection Failed!");
+        BTSerial.println("WiFi_Failed");
+    }
+}
+
+void processBluetoothInput() {
+    if (BTSerial.available()) {
+        String input = BTSerial.readStringUntil('\n');
+        input.trim();
+
+        if (input.startsWith("WIFI_SSID:")) {
+            ssid = input.substring(10);
+            Serial.println("Received SSID via Bluetooth");
+        } else if (input.startsWith("WIFI_PASS:")) {
+            password = input.substring(10);
+            Serial.println("Received Password via Bluetooth");
+        }
+        
+        if (ssid.length() > 0 && password.length() > 0) {
+            credentialsReceived = true;
+            saveWiFiCredentials(ssid, password);
+        }
+        
+        if (input == "FLASH_ON") {
+            flashLightState = true;
+            digitalWrite(LED_PIN, HIGH);
+            Serial.println("Flashlight ON");
+        } else if (input == "FLASH_OFF") {
+            flashLightState = false;
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("Flashlight OFF");
+        } else if (input == "FACE_RECOG_ON") {
+            faceRecognitionEnabled = true;
+            Serial.println("Face Recognition Enabled");
+        } else if (input == "FACE_RECOG_OFF") {
+            faceRecognitionEnabled = false;
+            Serial.println("Face Recognition Disabled");
+        } else if (input == "STREAM_ON") {
+            liveStreamEnabled = true;
+            Serial.println("Live Streaming Enabled");
+        } else if (input == "STREAM_OFF") {
+            liveStreamEnabled = false;
+            Serial.println("Live Streaming Disabled");
+        } else if (input == "CAPTURE_IMAGE") {
+            captureImage = true;
+            captureAndSendImage();
+        }
+    }
+}
+
+void captureAndSendImage() {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Image Capture Failed");
+        return;
+    }
+    esp_camera_fb_return(fb);
+    Serial.println("Image Captured and Sent");
+}
+
+void startCameraServer() {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri = {"/stream", HTTP_GET, streamHandler, NULL};
+        httpd_register_uri_handler(server, &uri);
+    }
+}
+
+static esp_err_t streamHandler(httpd_req_t *req) {
+    httpd_resp_send(req, "Camera Streaming", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+void saveWiFiCredentials(String ssid, String password) {
+    EEPROM.put(0, ssid);
+    EEPROM.put(50, password);
+    EEPROM.commit();
+}
+
+void loadWiFiCredentials() {
+    char ssidBuffer[50], passBuffer[50];
+    EEPROM.get(0, ssidBuffer);
+    EEPROM.get(50, passBuffer);
+    ssid = String(ssidBuffer);
+    password = String(passBuffer);
+}
